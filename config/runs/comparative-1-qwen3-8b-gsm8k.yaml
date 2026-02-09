@@ -1,0 +1,63 @@
+run_id: comparative-1-qwen3-8b-gsm8k
+method: TRIAD-AutoCoT (Fixed-Budget Cross-Strategy Agreement + Audit)
+model:
+  name: Qwen3-8B
+  precision: bf16
+  max_tokens: 256
+dataset:
+  name: gsm8k
+  split:
+    train: train[:300]
+    test: test[:200]
+  preprocessing:
+    max_length: 512
+    answer_type: int
+training:
+  task: icl_demo_selection
+  learning_rate: 1.0e-5
+  batch_size: 1
+  epochs: 1
+  optimizer: adamw
+  warmup_steps: 0
+  generation:
+    temperature_solve: 0.7
+    temperature_audit: 0.0
+    max_tokens: 256
+  clustering:
+    embed_model: all-MiniLM-L6-v2
+    k_clusters: 8
+    C_candidates_per_cluster: 5
+  triad_autocot:
+    S_modes: 4
+    R_samples_per_mode: 1
+    fixed_views_budget: 18
+    accept_p: 0.75
+    critic_model: Qwen3-8B
+    adaptive_stopping: false
+    paraphrase_invariance: false
+optuna:
+  n_trials: 20
+  search_spaces:
+    - param_name: k_clusters
+      distribution_type: categorical
+      choices: [6, 8, 10]
+    - param_name: C_candidates_per_cluster
+      distribution_type: categorical
+      choices: [3, 5]
+    - param_name: S_modes
+      distribution_type: categorical
+      choices: [3, 4]
+    - param_name: R_samples_per_mode
+      distribution_type: categorical
+      choices: [1, 2]
+    - param_name: fixed_views_budget
+      distribution_type: categorical
+      choices: [12, 18, 24]
+    - param_name: accept_p
+      distribution_type: uniform
+      low: 0.65
+      high: 0.9
+    - param_name: temperature_solve
+      distribution_type: uniform
+      low: 0.4
+      high: 0.9

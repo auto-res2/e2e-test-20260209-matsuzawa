@@ -1,0 +1,22 @@
+defaults:
+  - run: proposed-qwen3-8b-gsm8k
+
+mode: full
+results_dir: results
+seed: 42
+
+wandb:
+  entity: airas
+  project: 2026-02-09
+  mode: online
+
+evaluation:
+  paraphrase_k: 5
+  bootstrap_samples: 1000
+
+hydra:
+  run:
+    dir: ${results_dir}/${run.run_id}
+  output_subdir: null
+  job:
+    chdir: false
