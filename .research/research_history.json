@@ -970,5 +970,186 @@
     "experimental_code": "import os, re, random\nfrom collections import Counter\n\nimport numpy as np\nfrom datasets import load_dataset\nfrom sentence_transformers import SentenceTransformer\nfrom sklearn.cluster import KMeans\n\nfrom openai import OpenAI\nclient = OpenAI(api_key=os.environ.get(\"OPENAI_API_KEY\"))\n\n# ---------------- LLM wrapper\n\ndef chat(prompt, temperature=0.0, max_tokens=256, model=\"gpt-3.5-turbo\"):\n    r = client.chat.completions.create(\n        model=model,\n        temperature=temperature,\n        max_tokens=max_tokens,\n        messages=[{\"role\": \"user\", \"content\": prompt}],\n    )\n    return r.choices[0].message.content\n\n# ---------------- Parsing\n\ndef extract_last_int(text):\n    nums = re.findall(r\"-?\\d+\", text)\n    return int(nums[-1]) if nums else None\n\ndef extract_last_token(text):\n    toks = re.findall(r\"[A-Za-z]+\", text)\n    return toks[-1].lower() if toks else None\n\n# ---------------- Thinking modes (explicitly different solution styles)\n\nTHINK_MODES = {\n    \"direct\": \"Let's think step by step.\",\n    \"algebra\": \"Solve using equations/algebra. Show steps.\",\n    \"sanity\": \"Solve and include a quick estimation/sanity-check.\",\n    \"constraints\": \"Solve by checking constraints/units and consistency at each step.\",\n}\n\ndef solve(q, mode_key, temperature=0.7, model=\"gpt-3.5-turbo\"):\n    return chat(f\"Q: {q}\\nA: {THINK_MODES[mode_key]}\", temperature=temperature, max_tokens=256, model=model)\n\ndef paraphrase(q, model=\"gpt-3.5-turbo\"):\n    # Metamorphic rewrite: preserve meaning, keep all quantities.\n    prompt = (\n        \"Paraphrase the following problem WITHOUT changing its meaning. \"\n        \"Keep all numbers/units identical. Output only the paraphrased problem.\\n\\n\"\n        f\"Problem: {q}\"\n    )\n    return chat(prompt, temperature=0.3, max_tokens=200, model=model).strip()\n\ndef critique(q, rationale, model=\"gpt-3.5-turbo\"):\n    prompt = (\n        \"You are a meticulous auditor. If you find any concrete mistake in the solution, \"\n        \"output exactly 'ERROR'. Otherwise output exactly 'NO ERROR'.\\n\\n\"\n        f\"Question: {q}\\n\\nSolution:\\n{rationale}\\n\"\n    )\n    out = chat(prompt, temperature=0.0, max_tokens=10, model=model).strip().upper()\n    return 1 if \"ERROR\" in out else 0\n\n# ---------------- MFT-AutoCoT scoring with adaptive evidence gathering\n\ndef mft_score_question(q, answer_type=\"int\", S=4, K=2, R=1,\n                       accept_p=0.75, reject_p=0.40,\n                       max_views=24, tau=0.55,\n                       gen_model=\"gpt-3.5-turbo\", critic_model=None):\n    \"\"\"Adaptive procedure:\n    - views = (rewrite idx, mode, sample)\n    - stop early if agreement is clearly high/low\n    \"\"\"\n    if critic_model is None:\n        critic_model = gen_model\n\n    mode_keys = list(THINK_MODES.keys())[:S]\n    rewrites = [q]\n\n    answers, rationales, rewrite_ids = [], [], []\n\n    def parse_ans(txt):\n        return extract_last_int(txt) if answer_type == \"int\" else extract_last_token(txt)\n\n    def agreement():\n        vals = [a for a in answers if a is not None]\n        if not vals:\n            return 0.0, None\n        c = Counter(vals)\n        a_star, cnt = c.most_common(1)[0]\n        return cnt / len(vals), a_star\n\n    def paraphrase_invariance(a_star):\n        # For each rewrite, compute its modal answer and compare to a_star.\n        if a_star is None:\n            return 0.0\n        ok, total = 0, 0\n        for rid in set(rewrite_ids):\n            vals = [a for a, r in zip(answers, rewrite_ids) if r == rid and a is not None]\n            if not vals:\n                continue\n            total += 1\n            if Counter(vals).most_common(1)[0][0] == a_star:\n                ok += 1\n        return ok / total if total else 0.0\n\n    # staged evidence gathering\n    view_budget = 0\n    stage = 0\n    while view_budget < max_views:\n        # ensure enough rewrites\n        if stage > 0 and len(rewrites) < (1 + K):\n            rewrites.append(paraphrase(q, model=gen_model))\n\n        # add one batch of views: one sample for each (rewrite, mode)\n        for rid, rq in enumerate(rewrites):\n            for mk in mode_keys:\n                if view_budget >= max_views:\n                    break\n                for _ in range(R):\n                    rat = solve(rq, mk, temperature=0.7, model=gen_model)\n                    a = parse_ans(rat)\n                    answers.append(a)\n                    rationales.append(rat)\n                    rewrite_ids.append(rid)\n                    view_budget += 1\n\n        p, a_star = agreement()\n        if p <= reject_p and view_budget >= len(mode_keys):\n            return None\n\n        # if high agreement, run audit once and decide\n        if p >= accept_p and a_star is not None:\n            reps = [r for a, r in zip(answers, rationales) if a == a_star and a is not None]\n            z_star = min(reps, key=len)\n            e = critique(q, z_star, model=critic_model)\n            if e == 1:\n                return None\n            v = paraphrase_invariance(a_star)\n            g = 1.0 if parse_ans(z_star) is not None else 0.0\n            score = (p * max(v, 1e-6)) * (1 - e) * g\n            if score < tau:\n                return None\n            return {\"score\": score, \"q\": q, \"rationale\": z_star, \"answer\": a_star,\n                    \"p\": p, \"v\": v, \"audit_error\": e, \"views\": view_budget}\n\n        stage += 1\n        # expand evidence next stage: add a rewrite (up to K) and possibly one more mode\n        if len(mode_keys) < S:\n            mode_keys = list(THINK_MODES.keys())[:min(S, len(mode_keys)+1)]\n        if len(rewrites) >= (1 + K) and len(mode_keys) >= S:\n            # can't expand further, final decision by score without audit gating\n            break\n\n    # final attempt (budget exhausted): compute score + audit\n    p, a_star = agreement()\n    if a_star is None:\n        return None\n    reps = [r for a, r in zip(answers, rationales) if a == a_star and a is not None]\n    z_star = min(reps, key=len)\n    e = critique(q, z_star, model=critic_model)\n    if e == 1:\n        return None\n    v = paraphrase_invariance(a_star)\n    g = 1.0 if parse_ans(z_star) is not None else 0.0\n    score = (p * max(v, 1e-6)) * (1 - e) * g\n    if score < tau:\n        return None\n    return {\"score\": score, \"q\": q, \"rationale\": z_star, \"answer\": a_star,\n            \"p\": p, \"v\": v, \"audit_error\": e, \"views\": view_budget}\n\n# ---------------- Demo builder\n\ndef build_demos_mft(questions, k=8, C=5, answer_type=\"int\",\n                    S=4, K=2, accept_p=0.75, reject_p=0.40,\n                    max_views=24, tau=0.55,\n                    embed_model=\"all-MiniLM-L6-v2\",\n                    gen_model=\"gpt-3.5-turbo\", critic_model=None):\n    emb = SentenceTransformer(embed_model).encode(questions, normalize_embeddings=True)\n    km = KMeans(n_clusters=k, random_state=0, n_init=\"auto\").fit(emb)\n\n    demos = []\n    for c in range(k):\n        idxs = np.where(km.labels_ == c)[0]\n        if len(idxs) == 0:\n            continue\n        center = km.cluster_centers_[c]\n        dists = np.linalg.norm(emb[idxs] - center, axis=1)\n        cand = idxs[np.argsort(dists)[:min(C, len(idxs))]]\n\n        best = None\n        for i in cand:\n            res = mft_score_question(\n                questions[i], answer_type=answer_type, S=S, K=K,\n                accept_p=accept_p, reject_p=reject_p,\n                max_views=max_views, tau=tau,\n                gen_model=gen_model, critic_model=critic_model,\n            )\n            if res is None:\n                continue\n            if best is None or res[\"score\"] > best[\"score\"]:\n                best = res\n\n        if best is not None:\n            demos.append(best)\n\n    demo_prompt = \"\".join([f\"Q: {d['q']}\\nA: {d['rationale']}\\n\\n\" for d in demos])\n    return demo_prompt, demos\n\ndef answer_with_demos(demo_prompt, question, answer_type=\"int\", model=\"gpt-3.5-turbo\"):\n    prompt = demo_prompt + f\"Q: {question}\\nA: Let's think step by step.\"\n    rat = chat(prompt, temperature=0.0, max_tokens=256, model=model)\n    return extract_last_int(rat) if answer_type == \"int\" else extract_last_token(rat)\n\n# ---------------- Minimal GSM8K evaluation\nif __name__ == \"__main__\":\n    random.seed(0)\n    np.random.seed(0)\n\n    ds = load_dataset(\"gsm8k\", \"main\")\n    train_q = [x[\"question\"] for x in ds[\"train\"].select(range(300))]\n    test = ds[\"test\"].select(range(200))\n\n    demo_prompt, demos = build_demos_mft(\n        train_q, k=8, C=5, answer_type=\"int\",\n        S=4, K=2, accept_p=0.75, reject_p=0.40,\n        max_views=24, tau=0.55,\n        gen_model=\"gpt-3.5-turbo\", critic_model=\"gpt-3.5-turbo\",\n    )\n\n    correct = 0\n    for ex in test:\n        pred = answer_with_demos(demo_prompt, ex[\"question\"], answer_type=\"int\")\n        gold = extract_last_int(ex[\"answer\"])\n        correct += int(pred == gold)\n\n    print({\n        \"accuracy\": correct/len(test),\n        \"num_demos\": len(demos),\n        \"avg_demo_score\": float(np.mean([d[\"score\"] for d in demos])) if demos else 0.0,\n        \"avg_views_per_demo\": float(np.mean([d[\"views\"] for d in demos])) if demos else 0.0,\n        \"avg_p\": float(np.mean([d[\"p\"] for d in demos])) if demos else 0.0,\n        \"avg_v\": float(np.mean([d[\"v\"] for d in demos])) if demos else 0.0,\n    })\n",
     "expected_result": "On 200-example test slices with a mid-sized instruction model:\n- **GSM8K accuracy**: Zero-shot-CoT 0.35–0.45; Auto-CoT 0.45–0.55; V-AutoCoT 0.50–0.60; TRIAD-AutoCoT 0.54–0.64; **MFT-AutoCoT 0.57–0.67** (expected +0.02–0.04 over TRIAD by removing paraphrase-fragile demos; +0.04–0.07 over V-AutoCoT).\n- **SVAMP accuracy**: TRIAD 0.62–0.72; **MFT 0.64–0.74**.\n- **Last Letter Concatenation EM**: smaller but consistent gain: TRIAD 0.75–0.85; **MFT 0.77–0.87**.\n\nSecondary predictions:\n- **Selected-demo correctness rate (measured post-hoc with labels):** +5–12 points vs Auto-CoT; +2–6 points vs TRIAD.\n- **Cost:** Adaptive stopping reduces average construction calls by **20–40%** vs fixed S×K grids for the same acceptance quality (many low-quality candidates are rejected early).\n- **Robustness:** prompt-fragility (answer flips under paraphrase) among selected demos drops by **30–60%** relative to V-AutoCoT/TRIAD.\n\nHigher values are better for accuracy/EM and correctness rate; lower is better for cost and fragility.",
     "expected_conclusion": "MFT-AutoCoT reframes Auto-CoT demonstration curation as *metamorphic robustness + falsification under budget constraints*, closer to human practice: “state it differently and try to break it before teaching it.” Academically, it contributes (i) a new, task-agnostic reliability signal—**paraphrase invariance**—that targets prompt-fragile yet persuasive rationales (a major practical cause of misleading-by-similarity), and (ii) a **sequential, cost-adaptive** evidence-gathering procedure for black-box LLM curation. Practically and socially, it reduces the chance that deployed systems (especially tutoring/assistive settings) present authoritative but non-robust worked examples that anchor misconceptions, while keeping inference-time prompting unchanged and validation straightforward via a Python script on standard benchmarks."
+  },
+  "experimental_design": {
+    "experiment_summary": "Task: build an in-context learning (ICL) prompt consisting of a small set of worked examples (demonstrations) for grade-school math word problems, then answer unseen problems using that prompt. The experiment tests whether a *demonstration selection* method that explicitly checks metamorphic robustness (paraphrase invariance) and performs falsification audits produces safer, more generalizable demonstrations than a strong cross-strategy self-consistency baseline.\n\nWorkflow (single-dataset, single-model, Runner-scaled):\n1) **Demo-construction pool**: sample 300 GSM8K train questions.\n2) **Clustering (Auto-CoT style)**: embed questions with a small Sentence-BERT model and run k-means with k=8 clusters; for each cluster, consider C=5 centroid-near candidate questions.\n3) **Candidate scoring (method-dependent)**:\n   - **Proposed: MFT-AutoCoT**: for each candidate question q, gather answer evidence across multiple *thinking-mode prompts* and *meaning-preserving paraphrases* using sequential (cost-adaptive) stopping. Accept only if (a) cross-view answer agreement exceeds an accept bound, (b) paraphrase-invariance is high, and (c) a critic audit finds “NO ERROR”. Rank accepted candidates by a unified reliability score.\n   - **Baseline: TRIAD-AutoCoT (fixed budget)**: for each candidate q, sample a fixed grid of thinking modes and stochastic samples on the original wording only; accept/rank by cross-strategy agreement and a critic audit, without metamorphic rewrites or adaptive stopping.\n4) **Demo selection**: pick top-1 accepted candidate per cluster (≤8 demos) and format them as Q/A worked examples.\n5) **Test-time inference**: evaluate on 200 GSM8K test questions with the same inference prompt template for both methods (ICL + “Let’s think step by step”; temperature 0.0). Extract final numeric answer and compute metrics.\n\nScale choices to fit the provided Runner (H200 140GB VRAM / 240GB RAM):\n- Use **one local 8B instruction model** (fits comfortably on a single H200 with bf16) for generator+critic to avoid multi-model memory overhead.\n- Limit clusters to **k=8** and candidates per cluster to **C=5** (≤40 candidates scored).\n- Cap evidence per candidate to **max_views=18 solves + 1 audit** (adaptive stopping often uses fewer), making the full demo construction tractable on a single GPU.\n- Use only **GSM8K** (one dataset) and small slices (300 train pool, 200 test) to keep total generation calls and wall-clock time within a single-run budget while still exposing paraphrase-fragile reasoning failures.",
+    "runner_config": {
+      "runner_label": [
+        "self-hosted",
+        "gpu-runner"
+      ],
+      "description": "NVIDIA H200, VRAM: 140 GB, RAM: 240 GB"
+    },
+    "evaluation_metrics": [
+      {
+        "name": "accuracy",
+        "description": "**What counts as correct:** A prediction is correct if the model’s extracted final numeric answer equals the GSM8K gold answer after normalization.\n\n**Normalization/parsing:**\n1) From the model output, extract the last integer-like token using regex `-?\\d+`. If none found, mark as incorrect.\n2) From the GSM8K gold field, extract the last integer in the provided answer string (GSM8K format typically ends with the final number).\n3) Compare integers for exact equality.\n\n**Computation:** Let N be the number of test questions (N=200). For each i, define `c_i = 1` if `pred_i == gold_i` else 0. Then:\n`accuracy = (1/N) * Σ_i c_i`.\n\n**Why appropriate:** GSM8K has a single unambiguous numeric final answer; end-task utility is whether the final answer is correct.\n\n**Visualizations:**\n- Bar chart of accuracy with 95% bootstrap confidence intervals across methods.\n- Histogram of per-question correctness (0/1) aggregated by question-length or cluster (helps diagnose whether demo selection helps particular regions of the space)."
+      },
+      {
+        "name": "DemoCorrectnessRate",
+        "description": "**What counts as correct:** A selected demonstration is correct if the demonstration’s extracted final numeric answer equals the gold label for that *train* question (labels are used only for reporting, not for selection).\n\n**Computation:** If D demos are selected (D≤8), define `d_j=1` if demo j’s answer matches the gold label else 0. Then:\n`DemoCorrectnessRate = (1/D) * Σ_j d_j`.\n\n**Why appropriate:** The hypothesis is about avoiding stable-but-wrong exemplars; correctness of curated demos is a direct sanity check on the curation procedure.\n\n**Visualizations:**\n- Bar chart of demo correctness rate per method.\n- Table listing each selected demo with (cluster id, p agreement, v invariance, audit flag, gold correctness)."
+      },
+      {
+        "name": "AvgLLMCallsPerAcceptedDemo",
+        "description": "**Definition:** Average number of model generations used to accept one demonstration, capturing offline construction cost.\n\n**Counting rules:**\n- Each *solve* call for a (rewrite × thinking-mode × sample) view counts as 1 call.\n- Each *paraphrase generation* counts as 1 call.\n- Each *critic audit* counts as 1 call.\n\n**Computation:** If method accepts D demos and uses total T calls during scoring of those accepted candidates (including the evidence collected for them), then:\n`AvgLLMCallsPerAcceptedDemo = T / D`.\n(Optionally also report total calls over all candidates scored; but the primary cost view here is per accepted demo.)\n\n**Why appropriate:** MFT-AutoCoT claims cost-adaptive evidence collection; this metric directly measures that tradeoff.\n\n**Visualizations:**\n- Box/violin plot of calls per accepted demo across clusters.\n- Scatter plot of (score or agreement p) vs calls used (to show early stopping behavior)."
+      },
+      {
+        "name": "ParaphraseFragility_SelectedDemos",
+        "description": "**Goal:** quantify how often a selected demo’s final answer flips under meaning-preserving paraphrases—i.e., epistemic brittleness.\n\n**Protocol:** For each selected demo question q, generate K_eval paraphrases (e.g., 5) with strict constraints (same numbers/units). For each paraphrase, solve with the same fixed inference prompt as the demo rationale style (temperature 0.0). Extract final integer answers.\n\n**Computation:** For each demo j, compute invariance rate:\n`inv_j = (# paraphrases where answer == answer_on_original) / K_eval`.\nDefine fragility as `frag_j = 1 - inv_j`.\nReport mean fragility across demos:\n`ParaphraseFragility_SelectedDemos = (1/D) * Σ_j frag_j`.\n\n**Why appropriate:** The hypothesis targets “stable-but-wrong under rewrites”; this directly measures robustness to metamorphic transformations.\n\n**Visualizations:**\n- Histogram of demo-level invariance rates.\n- Paired plot comparing fragility of demos selected by baseline vs MFT."
+      },
+      {
+        "name": "RejectionRate_Candidates",
+        "description": "**Definition:** fraction of evaluated candidate questions that are rejected by the demo selection pipeline.\n\n**Computation:** If M candidates are evaluated (≈k*C but may vary by empty clusters) and R are rejected, then:\n`RejectionRate_Candidates = R / M`.\n\n**Why appropriate:** Helps interpret construction cost and selection strictness; MFT may reject more brittle candidates (expected).\n\n**Visualizations:**\n- Bar chart of rejection rate per method.\n- Stacked bars of rejection reasons (e.g., low agreement, failed audit, low invariance) for MFT."
+      }
+    ],
+    "models_to_use": [
+      "Qwen3-8B (8B parameters)"
+    ],
+    "datasets_to_use": [
+      "gsm8k"
+    ],
+    "proposed_method": {
+      "method_name": "MFT-AutoCoT (Metamorphic + Falsification-Driven, Cost-Adaptive Auto-CoT)",
+      "description": "Inference-only demonstration curation for ICL: (1) generate meaning-preserving paraphrases of candidate problems; (2) solve each view under multiple distinct reasoning-mode prompts; (3) sequentially add evidence until an accept/reject decision; (4) hard-veto candidates failing an explicit critic audit; (5) rank accepted candidates by a unified reliability score combining cross-view agreement and paraphrase invariance, penalizing unparseable/rambling outputs. Inference-time prompting is unchanged; only the offline demo selection differs.",
+      "optuna_config": {
+        "enabled": true,
+        "n_trials": 20,
+        "search_spaces": [
+          {
+            "param_name": "k_clusters",
+            "distribution_type": "categorical",
+            "choices": [
+              6,
+              8,
+              10
+            ]
+          },
+          {
+            "param_name": "C_candidates_per_cluster",
+            "distribution_type": "categorical",
+            "choices": [
+              3,
+              5
+            ]
+          },
+          {
+            "param_name": "S_modes_max",
+            "distribution_type": "categorical",
+            "choices": [
+              3,
+              4
+            ]
+          },
+          {
+            "param_name": "K_paraphrases_max",
+            "distribution_type": "categorical",
+            "choices": [
+              1,
+              2,
+              3
+            ]
+          },
+          {
+            "param_name": "max_views",
+            "distribution_type": "categorical",
+            "choices": [
+              12,
+              18,
+              24
+            ]
+          },
+          {
+            "param_name": "accept_p",
+            "distribution_type": "uniform",
+            "low": 0.65,
+            "high": 0.9
+          },
+          {
+            "param_name": "reject_p",
+            "distribution_type": "uniform",
+            "low": 0.2,
+            "high": 0.55
+          },
+          {
+            "param_name": "tau_score_threshold",
+            "distribution_type": "uniform",
+            "low": 0.35,
+            "high": 0.75
+          },
+          {
+            "param_name": "temperature_solve",
+            "distribution_type": "uniform",
+            "low": 0.4,
+            "high": 0.9
+          }
+        ]
+      }
+    },
+    "comparative_methods": [
+      {
+        "method_name": "TRIAD-AutoCoT (Fixed-Budget Cross-Strategy Agreement + Audit)",
+        "description": "A strong Auto-CoT-style demo selection baseline that (i) clusters training questions and evaluates centroid-near candidates, (ii) solves each candidate using multiple distinct reasoning-mode prompts (strategy prompting) with a *fixed* evidence budget on the original wording only, (iii) accepts/ranks candidates by cross-strategy answer agreement, and (iv) runs a critic audit that can veto candidates. Unlike MFT-AutoCoT, it does not perform metamorphic paraphrase invariance testing and does not use adaptive stopping (always spends the full grid budget per candidate).",
+        "optuna_config": {
+          "enabled": true,
+          "n_trials": 20,
+          "search_spaces": [
+            {
+              "param_name": "k_clusters",
+              "distribution_type": "categorical",
+              "choices": [
+                6,
+                8,
+                10
+              ]
+            },
+            {
+              "param_name": "C_candidates_per_cluster",
+              "distribution_type": "categorical",
+              "choices": [
+                3,
+                5
+              ]
+            },
+            {
+              "param_name": "S_modes",
+              "distribution_type": "categorical",
+              "choices": [
+                3,
+                4
+              ]
+            },
+            {
+              "param_name": "R_samples_per_mode",
+              "distribution_type": "categorical",
+              "choices": [
+                1,
+                2
+              ]
+            },
+            {
+              "param_name": "fixed_views_budget",
+              "distribution_type": "categorical",
+              "choices": [
+                12,
+                18,
+                24
+              ]
+            },
+            {
+              "param_name": "accept_p",
+              "distribution_type": "uniform",
+              "low": 0.65,
+              "high": 0.9
+            },
+            {
+              "param_name": "temperature_solve",
+              "distribution_type": "uniform",
+              "low": 0.4,
+              "high": 0.9
+            }
+          ]
+        }
+      }
+    ]
   }
 }
