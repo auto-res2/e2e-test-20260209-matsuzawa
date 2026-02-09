@@ -1,5 +1,5 @@
 defaults:
-  - run: proposed-qwen3-8b-gsm8k
+  - run: comparative-1-qwen3-8b-gsm8k
 
 mode: full
 results_dir: results
